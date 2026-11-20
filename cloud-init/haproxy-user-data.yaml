@@ -1,0 +1,116 @@
+#cloud-config
+# HAProxy load balancer for both clusters (one VM, two VIPs).
+#   VIP-MGMT 172.16.40.20 -> mgmt cluster (mgmt01-03): API 6443, join 9345, HTTP 80, HTTPS 443
+#   VIP-WKLD 172.16.40.21 -> ai-prod cluster: API 6443 to control plane, HTTP/HTTPS to workers
+# The VIPs are bound by HAProxy (ip_nonlocal_bind) and must also exist on the VM.
+# CHANGE: in MAAS, add 172.16.40.20 and 172.16.40.21 as extra static IPs (aliases) on this
+#         machine's interface, or add them with netplan.
+# CHANGE: every IP address below to match your network plan.
+package_update: true
+package_upgrade: true
+packages: [haproxy, chrony]
+write_files:
+  - path: /etc/sysctl.d/90-haproxy.conf
+    content: |
+      net.ipv4.ip_nonlocal_bind = 1
+  - path: /root/haproxy.cfg
+    permissions: '0644'
+    content: |
+      global
+          log /dev/log local0
+          maxconn 8192
+          user haproxy
+          group haproxy
+          daemon
+
+      defaults
+          mode tcp
+          log global
+          option tcplog
+          option dontlognull
+          timeout connect 5s
+          timeout client  1h
+          timeout server  1h
+          default-server inter 5s fall 3 rise 2
+
+      # Stats page: http://<haproxy-ip>:8404/
+      # CHANGE: 172.16.40.4 = this HAProxy VM's own IP
+      listen stats
+          bind 172.16.40.4:8404
+          mode http
+          stats enable
+          stats uri /
+          stats refresh 10s
+
+      # ---------- VIP-MGMT 172.16.40.20 : rke-mgmt (mgmt01-03) ----------
+      # CHANGE: VIP-MGMT and the mgmt node IPs (mgmt01 .5, mgmt02 .6, mgmt03 .7)
+      frontend mgmt_api
+          bind 172.16.40.20:6443
+          default_backend mgmt_api
+      backend mgmt_api
+          balance roundrobin
+          server mgmt01 172.16.40.5:6443 check
+          server mgmt02 172.16.40.6:6443 check
+          server mgmt03 172.16.40.7:6443 check
+
+      frontend mgmt_join
+          bind 172.16.40.20:9345
+          default_backend mgmt_join
+      backend mgmt_join
+          balance roundrobin
+          server mgmt01 172.16.40.5:9345 check
+          server mgmt02 172.16.40.6:9345 check
+          server mgmt03 172.16.40.7:9345 check
+
+      frontend mgmt_http
+          bind 172.16.40.20:80
+          default_backend mgmt_http
+      backend mgmt_http
+          balance roundrobin
+          server mgmt01 172.16.40.5:80 check
+          server mgmt02 172.16.40.6:80 check
+          server mgmt03 172.16.40.7:80 check
+
+      frontend mgmt_https
+          bind 172.16.40.20:443
+          default_backend mgmt_https
+      backend mgmt_https
+          balance roundrobin
+          server mgmt01 172.16.40.5:443 check
+          server mgmt02 172.16.40.6:443 check
+          server mgmt03 172.16.40.7:443 check
+
+      # ---------- VIP-WKLD 172.16.40.21 : ai-prod (wrkldc01-05) ----------
+      # CHANGE: VIP-WKLD, control-plane IPs (wrkldc01-03 .8-.10) and worker IPs (wrkldc04-05 .11-.12)
+      # API 6443 goes to the control-plane nodes.
+      frontend wkld_api
+          bind 172.16.40.21:6443
+          default_backend wkld_api
+      backend wkld_api
+          balance roundrobin
+          server wrkldc01 172.16.40.8:6443 check
+          server wrkldc02 172.16.40.9:6443 check
+          server wrkldc03 172.16.40.10:6443 check
+
+      # HTTP/HTTPS go to the workers, where the ingress controller (Traefik) runs.
+      frontend wkld_http
+          bind 172.16.40.21:80
+          default_backend wkld_http
+      backend wkld_http
+          balance roundrobin
+          server wrkldc04 172.16.40.11:80 check
+          server wrkldc05 172.16.40.12:80 check
+
+      frontend wkld_https
+          bind 172.16.40.21:443
+          default_backend wkld_https
+      backend wkld_https
+          balance roundrobin
+          server wrkldc04 172.16.40.11:443 check
+          server wrkldc05 172.16.40.12:443 check
+runcmd:
+  - sysctl --system
+  - cp /root/haproxy.cfg /etc/haproxy/haproxy.cfg
+  - haproxy -c -f /etc/haproxy/haproxy.cfg
+  - systemctl enable haproxy
+  - systemctl restart haproxy

@@ -1,0 +1,8 @@
+# Cluster: local (mgmt)
+# Rancher UI > local > Cluster Tools > Monitoring Dashboards > Install > Edit YAML
+# Change only these two keys (RKE2 instead of K3s). Other defaults already match
+# kube-prometheus-stack installed with release name "kube-prometheus-stack".
+etcd:
+  enabled: true
+k3sServer:
+  enabled: false

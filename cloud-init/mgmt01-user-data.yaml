@@ -1,0 +1,292 @@
+#cloud-config
+# mgmt01: FIRST server of the management cluster (rke-mgmt).
+# Installs RKE2 and, through the RKE2 auto-deploy manifests folder, also installs:
+#   cert-manager -> Rancher -> Longhorn -> kube-prometheus-stack -> remote-write ingress
+# Deploy this node first. mgmt02 and mgmt03 join it through the VIP.
+#
+# Before use, replace these placeholders (keep the same value in mgmt02/mgmt03):
+#   <RKE2_CLUSTER_TOKEN>          shared secret for RKE2 servers to join, e.g. `openssl rand -hex 16`
+#   <RANCHER_BOOTSTRAP_PASSWORD>  first-login password for the Rancher UI (admin user)
+package_update: true
+package_upgrade: true
+packages: [curl, jq, chrony, open-iscsi, nfs-common, cryptsetup, dmsetup]
+write_files:
+  # Longhorn prerequisites (iSCSI + dm_crypt kernel modules, multipath must ignore local disks)
+  - path: /etc/modules-load.d/longhorn.conf
+    content: |
+      iscsi_tcp
+      dm_crypt
+  - path: /etc/multipath.conf
+    append: true
+    content: |
+      blacklist {
+          devnode "^sd[a-z0-9]+"
+      }
+  - path: /etc/rancher/rke2/config.yaml
+    permissions: '0600'
+    content: |
+      # mgmt01 is the first server (starts the cluster), so there is no "server:" line here.
+      # CHANGE: same token on mgmt01, mgmt02 and mgmt03
+      token: <RKE2_CLUSTER_TOKEN>
+      # CHANGE: this node's IP
+      node-ip: 172.16.40.5
+      # CHANGE: your DNS names and VIP-MGMT. Every name/IP used to reach the API must be listed.
+      tls-san:
+        - rke-mgmt.gpu.lab
+        - rancher.gpu.lab
+        - 172.16.40.20
+        - mgmt01.gpu.lab
+        - mgmt02.gpu.lab
+        - mgmt03.gpu.lab
+      profile: cis
+      pod-security-admission-config-file: /etc/rancher/rke2/rancher-psa.yaml
+      write-kubeconfig-mode: "0600"
+      # etcd snapshots every 6 hours, keep 28 (7 days)
+      etcd-snapshot-schedule-cron: "0 */6 * * *"
+      etcd-snapshot-retention: 28
+  # Pod Security Admission: "restricted" by default, with exemptions for system and Rancher
+  # namespaces. Same file on all three mgmt nodes.
+  - path: /etc/rancher/rke2/rancher-psa.yaml
+    permissions: '0600'
+    content: |
+      apiVersion: apiserver.config.k8s.io/v1
+      kind: AdmissionConfiguration
+      plugins:
+        - name: PodSecurity
+          configuration:
+            apiVersion: pod-security.admission.config.k8s.io/v1
+            kind: PodSecurityConfiguration
+            defaults:
+              enforce: "restricted"
+              enforce-version: "latest"
+              audit: "restricted"
+              audit-version: "latest"
+              warn: "restricted"
+              warn-version: "latest"
+            exemptions:
+              usernames: []
+              runtimeClasses: []
+              namespaces: [calico-apiserver, calico-system, tigera-operator,
+                cattle-alerting, cattle-capi-system, cattle-csp-adapter-system,
+                cattle-elemental-system, cattle-epinio-system, cattle-externalip-system,
+                cattle-fleet-local-system, cattle-fleet-system, cattle-gatekeeper-system,
+                cattle-global-data, cattle-global-nt, cattle-impersonation-system,
+                cattle-istio, cattle-istio-system, cattle-logging, cattle-logging-system,
+                cattle-monitoring-system, cattle-neuvector-system, cattle-prometheus,
+                cattle-provisioning-capi-system, cattle-resources-system, cattle-scc-system,
+                cattle-sriov-system, cattle-system, cattle-turtles-system,
+                cattle-ui-plugin-system, cattle-windows-gmsa-system,
+                cert-manager, cis-operator-system, compliance-operator-system,
+                longhorn-system, rancher-alerting-drivers, rancher-compliance-system,
+                security-scan, sr-operator-system, traefik,
+                fleet-default, fleet-local, istio-system,
+                kube-node-lease, kube-public, kube-system]
+  # ---------- Auto-deploy manifests (RKE2 Helm controller installs them in name order) ----------
+  - path: /var/lib/rancher/rke2/server/manifests/10-cert-manager.yaml
+    permissions: '0600'
+    content: |
+      apiVersion: helm.cattle.io/v1
+      kind: HelmChart
+      metadata:
+        name: cert-manager
+        namespace: kube-system
+      spec:
+        repo: https://charts.jetstack.io
+        chart: cert-manager
+        # CHANGE (optional): pick a version supported by your Rancher version
+        version: v1.21.2
+        targetNamespace: cert-manager
+        createNamespace: true
+        valuesContent: |-
+          crds:
+            enabled: true
+  - path: /var/lib/rancher/rke2/server/manifests/20-rancher.yaml
+    permissions: '0600'
+    content: |
+      apiVersion: helm.cattle.io/v1
+      kind: HelmChart
+      metadata:
+        name: rancher
+        namespace: kube-system
+      spec:
+        repo: https://releases.rancher.com/server-charts/stable
+        chart: rancher
+        # CHANGE (optional): Rancher version (check the RKE2/Kubernetes support matrix)
+        version: 2.15.3
+        targetNamespace: cattle-system
+        createNamespace: true
+        # The first install attempt can fail while cert-manager is still starting;
+        # the Helm controller retries automatically.
+        valuesContent: |-
+          # CHANGE: Rancher URL (DNS record must point to VIP-MGMT)
+          hostname: rancher.gpu.lab
+          # CHANGE: first-login password
+          bootstrapPassword: <RANCHER_BOOTSTRAP_PASSWORD>
+          replicas: 3
+          ingress:
+            # RKE2 ships ingress-nginx on this cluster
+            ingressClassName: nginx
+  - path: /var/lib/rancher/rke2/server/manifests/30-longhorn.yaml
+    permissions: '0600'
+    content: |
+      apiVersion: helm.cattle.io/v1
+      kind: HelmChart
+      metadata:
+        name: longhorn
+        namespace: kube-system
+      spec:
+        repo: https://charts.longhorn.io
+        chart: longhorn
+        version: 1.13.0
+        targetNamespace: longhorn-system
+        createNamespace: true
+        valuesContent: |-
+          persistence:
+            defaultClass: true
+            # CHANGE: replica count must not be higher than the number of nodes
+            defaultClassReplicaCount: 3
+            reclaimPolicy: Retain
+          defaultSettings:
+            # CHANGE: mount point of the Longhorn data disk (set in MAAS storage: sdb -> /var/lib/longhorn)
+            defaultDataPath: /var/lib/longhorn/
+            storageReservedPercentageForDefaultDisk: 10
+  - path: /var/lib/rancher/rke2/server/manifests/40-kube-prometheus-stack.yaml
+    permissions: '0600'
+    content: |
+      apiVersion: helm.cattle.io/v1
+      kind: HelmChart
+      metadata:
+        name: kube-prometheus-stack
+        namespace: kube-system
+      spec:
+        repo: https://prometheus-community.github.io/helm-charts
+        chart: kube-prometheus-stack
+        version: 93.4.0
+        targetNamespace: cattle-monitoring-system
+        createNamespace: true
+        valuesContent: |
+          prometheus:
+            prometheusSpec:
+              # CHANGE: retention (1 day / 8 GiB is sized for a lab)
+              retention: 1d
+              retentionSize: 8GiB
+              serviceMonitorSelectorNilUsesHelmValues: false
+              podMonitorSelectorNilUsesHelmValues: false
+              ruleSelectorNilUsesHelmValues: false
+              resources:
+                requests:
+                  cpu: 750m
+                  memory: 1750Mi
+                limits:
+                  cpu: 1000m
+                  memory: 4000Mi
+              storageSpec:
+                volumeClaimTemplate:
+                  spec:
+                    storageClassName: longhorn
+                    accessModes:
+                    - ReadWriteOnce
+                    resources:
+                      requests:
+                        storage: 10Gi
+              # Receives metrics from workload clusters (Prometheus agent remote write)
+              enableRemoteWriteReceiver: true
+          alertmanager:
+            alertmanagerSpec:
+              retention: 24h
+              storage:
+                volumeClaimTemplate:
+                  spec:
+                    storageClassName: longhorn
+                    accessModes:
+                    - ReadWriteOnce
+                    resources:
+                      requests:
+                        storage: 2Gi
+          grafana:
+            deploymentStrategy:
+              type: Recreate
+            persistence:
+              enabled: true
+              type: pvc
+              storageClassName: longhorn
+              accessModes:
+              - ReadWriteOnce
+              size: 5Gi
+            # Embedding + anonymous Viewer are needed for the Rancher "Monitoring Dashboards" tool
+            grafana.ini:
+              security:
+                allow_embedding: true
+              auth:
+                disable_login_form: false
+              auth.anonymous:
+                enabled: true
+                org_role: Viewer
+              users:
+                auto_assign_org_role: Viewer
+              dashboards:
+                default_home_dashboard_path: /tmp/dashboards/rancher-default-home.json
+            sidecar:
+              dashboards:
+                multicluster:
+                  global:
+                    enabled: true
+          defaultRules:
+            additionalAggregationLabels:
+            - cluster
+          # RKE2 does not expose these components on the default ports
+          kubeEtcd:
+            enabled: false
+          kubeControllerManager:
+            enabled: false
+          kubeScheduler:
+            enabled: false
+          kubeProxy:
+            enabled: false
+  # Remote-write endpoint for workload clusters, protected with basic auth.
+  # The secret "prom-remote-write-auth" is NOT in this file: create it once after install (see README).
+  - path: /var/lib/rancher/rke2/server/manifests/45-prometheus-remote-write-ingress.yaml
+    permissions: '0600'
+    content: |
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: prometheus-remote-write
+        namespace: cattle-monitoring-system
+        annotations:
+          nginx.ingress.kubernetes.io/auth-type: basic
+          nginx.ingress.kubernetes.io/auth-secret: prom-remote-write-auth
+          nginx.ingress.kubernetes.io/auth-realm: "Prometheus remote write"
+          nginx.ingress.kubernetes.io/proxy-body-size: 16m
+      spec:
+        ingressClassName: nginx
+        rules:
+          # CHANGE: remote-write DNS name (must point to VIP-MGMT)
+          - host: prom-write.gpu.lab
+            http:
+              paths:
+                - path: /api/v1/write
+                  pathType: Exact
+                  backend:
+                    service:
+                      name: kube-prometheus-stack-prometheus
+                      port:
+                        number: 9090
+  - path: /etc/profile.d/rke2.sh
+    content: |
+      export PATH=$PATH:/var/lib/rancher/rke2/bin
+      export KUBECONFIG=/etc/rancher/rke2/rke2.yaml
+runcmd:
+  - swapoff -a
+  - sed -i '/ swap / s/^/#/' /etc/fstab
+  - modprobe iscsi_tcp
+  - modprobe dm_crypt
+  - systemctl enable --now iscsid chrony
+  - systemctl restart multipathd || true
+  # CIS profile requires an etcd user
+  - id etcd || useradd -r -c "etcd user" -s /sbin/nologin -M etcd -U
+  # CHANGE (optional): RKE2 version. Keep it pinned and the same on all mgmt nodes.
+  - curl -sfL https://get.rke2.io | INSTALL_RKE2_VERSION=v1.35.10+rke2r1 INSTALL_RKE2_TYPE=server sh -
+  - cp -f /usr/local/share/rke2/rke2-cis-sysctl.conf /etc/sysctl.d/60-rke2-cis.conf
+  - systemctl restart systemd-sysctl
+  - systemctl enable --now rke2-server

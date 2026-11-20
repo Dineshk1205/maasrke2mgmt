@@ -1,0 +1,77 @@
+#cloud-config
+# ai-prod control plane: wrkldc01, wrkldc02, wrkldc03 (same file for all 3).
+# Prepares the OS and prerequisites, then registers the node with Rancher (etcd + control plane).
+# Rancher then installs RKE2 itself, using the settings of the cluster created in the Rancher UI
+# (v1.35.10+rke2r1, CIS profile, Cilium).
+#
+# Before use:
+#   1. In Rancher: Cluster Management > Create > Custom, create the cluster (e.g. ai-prod).
+#   2. On the Registration tab, copy the command and take two values from it:
+#        <RANCHER_REGISTRATION_TOKEN>   value after --token
+#        <RANCHER_CA_CHECKSUM>          value after --ca-checksum
+#   3. Put them in the ExecStart line below (and in wrkldc-gpu-user-data.yaml).
+# The token belongs to ONE cluster. A new cluster needs a new token.
+package_update: true
+package_upgrade: true
+packages: [curl, jq, chrony, open-iscsi, nfs-common, cryptsetup, dmsetup]
+write_files:
+  # Longhorn prerequisites
+  - path: /etc/modules-load.d/longhorn.conf
+    content: |
+      iscsi_tcp
+      dm_crypt
+  - path: /etc/multipath.conf
+    append: true
+    content: |
+      blacklist {
+          devnode "^sd[a-z0-9]+"
+      }
+  # Kernel settings required by the RKE2 CIS profile (Rancher installs RKE2 later,
+  # so they are set here before registration)
+  - path: /etc/sysctl.d/60-rke2-cis.conf
+    content: |
+      vm.panic_on_oom=0
+      vm.overcommit_memory=1
+      kernel.panic=10
+      kernel.panic_on_oops=1
+  - path: /etc/sysctl.d/70-k8s-inotify.conf
+    content: |
+      fs.inotify.max_user_instances=8192
+      fs.inotify.max_user_watches=524288
+  - path: /etc/profile.d/rke2.sh
+    content: |
+      export PATH=$PATH:/var/lib/rancher/rke2/bin
+      export KUBECONFIG=/etc/rancher/rke2/rke2.yaml
+  # One-time registration with Rancher. Retries every 30 s until Rancher is reachable,
+  # then writes /var/lib/rancher-register.done so it never runs again.
+  # CHANGE: rancher.gpu.lab (2 places) = your Rancher URL
+  # CHANGE: <RANCHER_REGISTRATION_TOKEN> and <RANCHER_CA_CHECKSUM> from the Rancher Registration tab
+  # Roles: --etcd --controlplane (no workloads on these nodes)
+  - path: /etc/systemd/system/rancher-register.service
+    content: |
+      [Unit]
+      Description=Register this node with Rancher (runs once)
+      Wants=network-online.target
+      After=network-online.target
+      ConditionPathExists=!/var/lib/rancher-register.done
+      [Service]
+      Type=oneshot
+      ExecStart=/bin/bash -c "set -o pipefail; curl --insecure -fL https://rancher.gpu.lab/system-agent-install.sh | sh -s - --server https://rancher.gpu.lab --label cattle.io/os=linux --token <RANCHER_REGISTRATION_TOKEN> --ca-checksum <RANCHER_CA_CHECKSUM> --etcd --controlplane && touch /var/lib/rancher-register.done"
+      Restart=on-failure
+      RestartSec=30
+      [Install]
+      WantedBy=multi-user.target
+runcmd:
+  - swapoff -a
+  - sed -i '/ swap / s/^/#/' /etc/fstab
+  - modprobe iscsi_tcp
+  - modprobe dm_crypt
+  - systemctl enable --now iscsid chrony
+  - systemctl restart multipathd || true
+  # CIS profile requires an etcd user on etcd nodes
+  - id etcd || useradd -r -c "etcd user" -s /sbin/nologin -M etcd -U
+  - sysctl --system
+  - systemctl daemon-reload
+  - systemctl enable rancher-register.service
+  # --no-block: cloud-init finishes; registration continues in the background
+  - systemctl start --no-block rancher-register.service

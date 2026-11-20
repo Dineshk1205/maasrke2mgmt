@@ -1,0 +1,102 @@
+#cloud-config
+# ai-prod GPU workers: wrkldc04, wrkldc05 (same file for both).
+# Prepares the OS and prerequisites, installs the NVIDIA vGPU guest driver (GRID) and its
+# licence token, reboots once, then registers with Rancher as a worker with label gpu=true.
+# The GPU Operator (deployed by Fleet) runs with driver.enabled=false and uses this driver.
+#
+# This file is for VMs with an NVIDIA vGPU profile (e.g. vSphere nvidia_rtxa6000-12q).
+# For GPU passthrough or bare-metal GPUs: remove the GRID driver and licence lines
+# (marked VGPU-ONLY), remove the ExecStartPre=/usr/bin/nvidia-smi line, and let the
+# GPU Operator install the driver (driver.enabled=true).
+#
+# Before use:
+#   1. Put on an internal web server that the nodes can reach (NOT in Git, the driver
+#      is licensed by NVIDIA and the token is a secret):
+#        - the GRID guest driver .deb (must match the vGPU Manager version on the host)
+#        - client_configuration_token.tok (from your NVIDIA licence server / DLS / CLS)
+#   2. Replace <RANCHER_REGISTRATION_TOKEN> and <RANCHER_CA_CHECKSUM> (same values as
+#      wrkldc-cp-user-data.yaml).
+# package_upgrade is false on purpose: the driver is built for the running kernel.
+package_update: true
+package_upgrade: false
+packages: [curl, jq, chrony, open-iscsi, nfs-common, cryptsetup, dmsetup, dkms, build-essential, linux-headers-generic]
+write_files:
+  # Longhorn prerequisites
+  - path: /etc/modules-load.d/longhorn.conf
+    content: |
+      iscsi_tcp
+      dm_crypt
+  - path: /etc/multipath.conf
+    append: true
+    content: |
+      blacklist {
+          devnode "^sd[a-z0-9]+"
+      }
+  # Kernel settings required by the RKE2 CIS profile
+  - path: /etc/sysctl.d/60-rke2-cis.conf
+    content: |
+      vm.panic_on_oom=0
+      vm.overcommit_memory=1
+      kernel.panic=10
+      kernel.panic_on_oops=1
+  - path: /etc/sysctl.d/70-k8s-inotify.conf
+    content: |
+      fs.inotify.max_user_instances=8192
+      fs.inotify.max_user_watches=524288
+  - path: /etc/profile.d/rke2.sh
+    content: |
+      export PATH=$PATH:/var/lib/rancher/rke2/bin
+      export KUBECONFIG=/etc/rancher/rke2/rke2.yaml
+  # The open-source nouveau driver must not load, or the NVIDIA driver cannot use the GPU
+  - path: /etc/modprobe.d/blacklist-nouveau.conf
+    content: |
+      blacklist nouveau
+      options nouveau modeset=0
+  # One-time registration with Rancher, after reboot. ExecStartPre waits until nvidia-smi
+  # works, so the node only joins when the GPU driver is loaded.
+  # CHANGE: rancher.gpu.lab (2 places) = your Rancher URL
+  # CHANGE: <RANCHER_REGISTRATION_TOKEN> and <RANCHER_CA_CHECKSUM> from the Rancher Registration tab
+  # Roles: --worker, with node label gpu=true (used by Fleet/workloads to select GPU nodes)
+  - path: /etc/systemd/system/rancher-register.service
+    content: |
+      [Unit]
+      Description=Register this node with Rancher (runs once)
+      Wants=network-online.target
+      After=network-online.target nvidia-persistenced.service
+      ConditionPathExists=!/var/lib/rancher-register.done
+      [Service]
+      Type=oneshot
+      ExecStartPre=/usr/bin/nvidia-smi
+      ExecStart=/bin/bash -c "set -o pipefail; curl --insecure -fL https://rancher.gpu.lab/system-agent-install.sh | sh -s - --server https://rancher.gpu.lab --label cattle.io/os=linux --token <RANCHER_REGISTRATION_TOKEN> --ca-checksum <RANCHER_CA_CHECKSUM> --worker --label gpu=true && touch /var/lib/rancher-register.done"
+      Restart=on-failure
+      RestartSec=30
+      [Install]
+      WantedBy=multi-user.target
+runcmd:
+  - swapoff -a
+  - sed -i '/ swap / s/^/#/' /etc/fstab
+  - modprobe iscsi_tcp
+  - modprobe dm_crypt
+  - systemctl enable --now iscsid chrony
+  - systemctl restart multipathd || true
+  - sysctl --system
+  - apt-get install -y linux-headers-$(uname -r)
+  # VGPU-ONLY start
+  # CHANGE: 172.16.40.3:8081 = your internal file server; file name = your GRID driver version
+  - curl -fsSL -o /root/nvidia-grid.deb http://172.16.40.3:8081/nvidia-linux-grid-595_595.112.07_amd64.deb
+  - apt-get install -y /root/nvidia-grid.deb
+  - mkdir -p /etc/nvidia/ClientConfigToken
+  # CHANGE: same file server; the licence token file name
+  - curl -fsSL -o /etc/nvidia/ClientConfigToken/client_configuration_token.tok http://172.16.40.3:8081/client_configuration_token.tok
+  - chmod 744 /etc/nvidia/ClientConfigToken/client_configuration_token.tok
+  - cp -n /etc/nvidia/gridd.conf.template /etc/nvidia/gridd.conf
+  - update-initramfs -u
+  - systemctl enable nvidia-gridd nvidia-persistenced
+  # VGPU-ONLY end
+  - systemctl daemon-reload
+  - systemctl enable rancher-register.service
+# Reboot once to load the NVIDIA driver; rancher-register.service runs on the next boot.
+power_state:
+  mode: reboot
+  message: Rebooting to load the NVIDIA vGPU driver; Rancher registration runs after boot
+  condition: true

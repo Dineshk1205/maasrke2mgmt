@@ -1,0 +1,15 @@
+# Cluster: local (mgmt)
+# Rancher UI > local > Cluster Tools > NeuVector > Install > Edit YAML
+# Change only these keys in the default YAML.
+# CHANGE: admin password for the NeuVector login (change it again after first login)
+bootstrapPassword: <NEUVECTOR_ADMIN_PASSWORD>
+controller:
+  pvc:
+    # Keep NeuVector config and policies across restarts
+    enabled: true
+    storageClass: longhorn
+    # Shared by the 3 controllers (Longhorn RWX)
+    accessModes:
+      - ReadWriteMany
+    capacity: 5Gi
+# Container runtime: keep the defaults. NeuVector detects the RKE2 containerd socket.
